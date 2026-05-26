@@ -1,24 +1,18 @@
-INSTALL INSTRUCTIONS
-====================
 
-Requirements:
-- Garry's Mod x86-64 Chromium branch
-- A web browser (Chrome or Firefox)
+Binary Module
 
-Step 1: Binary Module
----------------------
 Copy bin/gmcl_webcam_win64.dll to:
   <GMod>/garrysmod/lua/bin/gmcl_webcam_win64.dll
 
 Create the lua/bin/ folder if it doesn't exist.
 
-Step 2: Addon
--------------
+Addon:
+
 Copy the addon/ folder to your addons directory:
   <GMod>/garrysmod/addons/webcam/
 
-Step 3: Usage
--------------
+Usage:
+
 1. Launch GMod
 2. Open console, run: webcam_start
 3. Open http://127.0.0.1:27099 in your browser
