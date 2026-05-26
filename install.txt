@@ -1,0 +1,38 @@
+INSTALL INSTRUCTIONS
+====================
+
+Requirements:
+- Garry's Mod x86-64 Chromium branch
+- A web browser (Chrome or Firefox)
+
+Step 1: Binary Module
+---------------------
+Copy bin/gmcl_webcam_win64.dll to:
+  <GMod>/garrysmod/lua/bin/gmcl_webcam_win64.dll
+
+Create the lua/bin/ folder if it doesn't exist.
+
+Step 2: Addon
+-------------
+Copy the addon/ folder to your addons directory:
+  <GMod>/garrysmod/addons/webcam/
+
+Step 3: Usage
+-------------
+1. Launch GMod
+2. Open console, run: webcam_start
+3. Open http://127.0.0.1:27099 in your browser
+4. Click "Allow Camera Access"
+5. Your webcam is now live in-game
+
+Console Commands:
+  webcam_start    - Start webcam server
+  webcam_stop     - Stop webcam server
+  webcam_hud      - Toggle HUD preview
+
+Material Tool:
+  The material "webcam" appears in the toolgun material list.
+
+Webcam Screen Entity:
+  Spawn from Entities tab > Webcam category.
+  Right-click > Edit Properties to adjust size and position.
