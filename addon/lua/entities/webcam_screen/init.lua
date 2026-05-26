@@ -29,6 +29,8 @@ function ENT:Initialize()
     self:SetMoveType(MOVETYPE_VPHYSICS)
     self:SetSolid(SOLID_VPHYSICS)
     self:DrawShadow(false)
+    self:SetRenderMode(RENDERMODE_TRANSALPHA)
+    self:SetColor(Color(255, 255, 255, 1))
 
     local d = LoadDefaults()
     self:SetScreenScale(d.ScreenScale or 1)
