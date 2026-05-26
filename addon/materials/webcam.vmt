@@ -1,0 +1,6 @@
+"UnlitGeneric"
+{
+    "$basetexture" "webcam_feed"
+    "$nolod" "1"
+    "$no_fullbright" "1"
+}
