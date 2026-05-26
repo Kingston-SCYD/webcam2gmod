@@ -5,7 +5,6 @@ local panelReady = false
 local lastUpdate = 0
 local curW, curH = 640, 480
 local WebcamMat = nil
-local frameNum = 0
 
 local function InitPanel()
     if IsValid(WebcamPanel) then WebcamPanel:Remove() end
@@ -14,14 +13,13 @@ local function InitPanel()
     WebcamPanel = vgui.Create("DHTML")
     WebcamPanel:SetSize(640, 480)
     WebcamPanel:SetVisible(false)
-    WebcamPanel:SetHTML([[<html><body style="margin:0;background:#000">
+    WebcamPanel:SetHTML([[<html><body style="margin:0;background:transparent">
 <img id="f" style="width:100%;height:100%">
 <script>
 var t=0;
 function F(){document.getElementById('f').src='asset://garrysmod/data/webcam_frame.dat?t='+(t++);setTimeout(F,16);}
 F();
-</script>
-</body></html>]])
+</script></body></html>]])
     timer.Simple(0.5, function()
         if IsValid(WebcamPanel) then panelReady = true end
     end)
@@ -56,7 +54,7 @@ hook.Add("PostRender", "WebcamRT", function()
     local v = 480 / texH
 
     render.PushRenderTarget(RT)
-    render.Clear(0, 0, 0, 255)
+    render.Clear(0, 0, 0, 0)
     render.SetViewPort(0, 0, 1024, 1024)
     cam.Start2D()
         render.SetMaterial(htmlMat)
@@ -72,7 +70,8 @@ hook.Add("PostRender", "WebcamRT", function()
 end)
 
 -- Public API
-webcam_texture = webcam_texture or {}function webcam_texture.GetMaterial()
+webcam_texture = webcam_texture or {}
+function webcam_texture.GetMaterial()
     if not IsValid(WebcamPanel) then return nil end
     if not WebcamMat then WebcamMat = WebcamPanel:GetHTMLMaterial() end
     return WebcamMat
