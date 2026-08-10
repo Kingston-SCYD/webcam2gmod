@@ -48,7 +48,6 @@ garrysmod/addons/webcam/
 | `webcam_start` | Start the webcam server |
 | `webcam_stop` | Stop the webcam server |
 | `webcam_hud` | Toggle HUD preview |
-| `webcam_settings` | Open texture settings (scale, rotation, offset, tiling) |
 
 ### Material Tool
 Select the Material tool in the toolgun. The material `webcam` is in the material list. Apply it to any prop.
