@@ -219,6 +219,29 @@ local function OpenSettings()
 end
 concommand.Add("webcam_settings", OpenSettings)
 
+-- Add to Q menu under Utilities
+hook.Add("PopulateToolMenu", "WebcamSettings", function()
+    spawnmenu.AddToolMenuOption("Utilities", "User", "webcam_texture_settings", "Webcam Texture", "", "", function(panel)
+        panel:ClearControls()
+        panel:NumSlider("Scale", "webcam_tex_scale", 0.1, 10, 2)
+        panel:NumSlider("Rotation", "webcam_tex_rotation", -180, 180, 1)
+        panel:NumSlider("Offset X", "webcam_tex_offset_x", -1, 1, 3)
+        panel:NumSlider("Offset Y", "webcam_tex_offset_y", -1, 1, 3)
+        panel:CheckBox("Flip Horizontal", "webcam_tex_flip_h")
+        panel:CheckBox("Flip Vertical", "webcam_tex_flip_v")
+        panel:CheckBox("Tiling (repeat texture)", "webcam_tex_tile")
+        panel:Button("Reset to Defaults").DoClick = function()
+            RunConsoleCommand("webcam_tex_scale", "1")
+            RunConsoleCommand("webcam_tex_rotation", "0")
+            RunConsoleCommand("webcam_tex_offset_x", "0")
+            RunConsoleCommand("webcam_tex_offset_y", "0")
+            RunConsoleCommand("webcam_tex_flip_h", "0")
+            RunConsoleCommand("webcam_tex_flip_v", "0")
+            RunConsoleCommand("webcam_tex_tile", "1")
+        end
+    end)
+end)
+
 -- Public API
 webcam_texture = webcam_texture or {}
 function webcam_texture.GetMaterial()
