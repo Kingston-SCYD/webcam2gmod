@@ -7,6 +7,9 @@ ENT.AdminOnly = false
 ENT.Editable = true
 
 function ENT:SetupDataTables()
+    -- Who this screen shows. Set to whoever spawned it.
+    self:NetworkVar("Entity", 0, "Streamer")
+
     self:NetworkVar("Float", 0, "ScreenScale", {
         KeyName = "screen_scale",
         Edit = { type = "Float", order = 1, min = 0.25, max = 10, title = "Size" }
@@ -35,4 +38,9 @@ function ENT:SetupDataTables()
         KeyName = "rot_z",
         Edit = { type = "Float", order = 7, min = -180, max = 180, title = "Rotation Roll" }
     })
+end
+
+function ENT:GetStreamerName()
+    local ply = self:GetStreamer()
+    return IsValid(ply) and ply:Nick() or "nobody"
 end
