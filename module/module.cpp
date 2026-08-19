@@ -6,6 +6,7 @@
 #include <string>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 
 #ifdef _WIN32
@@ -18,6 +19,7 @@ typedef SOCKET socket_t;
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 typedef int socket_t;
@@ -47,6 +49,8 @@ static std::mutex g_frameMutex;
 static std::vector<unsigned char> g_frameData;
 static std::vector<unsigned char> g_rgbaData;
 static int g_frameWidth = 0, g_frameHeight = 0;
+static int g_frameId = 0;        // bumped for each received frame
+static int g_rgbaFrameId = -1;   // which frame g_rgbaData was decoded from
 static int g_port = 27099;
 static socket_t g_wsListenSock = INVALID_SOCKET;
 
@@ -54,6 +58,21 @@ static socket_t g_wsListenSock = INVALID_SOCKET;
 static std::atomic<bool> g_chromaEnabled(false);
 static std::atomic<int> g_chromaR(0), g_chromaG(255), g_chromaB(0);
 static std::atomic<int> g_chromaThreshold(80);
+
+// Low bandwidth copy of the frame, produced by the browser page, used for
+// multiplayer streaming. The browser polls /cfg to learn what size/quality
+// it should encode this at, so Lua can throttle it to the server's limit.
+static std::mutex g_netMutex;
+static std::vector<unsigned char> g_netFrameData;
+static std::atomic<int> g_netW(320), g_netQ(60), g_netFps(10);
+static std::atomic<bool> g_netEnabled(false);
+
+// True while a browser is actually attached to the websocket.
+static std::atomic<bool> g_camConnected(false);
+static std::atomic<int> g_framesReceived(0);
+static std::atomic<int> g_camDrops(0);
+static std::atomic<int> g_lastDrop(0);        // 0 none, 1 close frame, 2 peer closed, 3 error
+static std::atomic<int> g_lastDropErrno(0);
 
 // Embedded HTML page (served at /)
 static const char* HTML_PAGE = R"HTML(
@@ -82,8 +101,8 @@ button:hover{background:#2b8}
 <label>FPS: <select id="fps">
 <option value="10">10</option>
 <option value="15">15</option>
-<option value="20">20</option>
-<option value="30" selected>30</option>
+<option value="20" selected>20</option>
+<option value="30">30</option>
 </select></label>
 <label>Quality: <input type="range" id="qual" min="10" max="100" value="75" style="width:80px"><span id="qualVal">75%</span></label>
 </div>
@@ -93,60 +112,169 @@ button:hover{background:#2b8}
 <label>Threshold: <input type="range" id="chromaThr" min="10" max="200" value="80" style="width:80px"><span id="thrVal">80</span></label>
 </div>
 <div id="status" class="off">Click the button above to start</div>
-<video id="v" autoplay playsinline style="display:none"></video>
+<div id="netInfo" style="font-size:12px;opacity:.7">multiplayer: idle</div>
+<div id="diag" style="font-size:11px;opacity:.55;font-family:monospace"></div>
+<video id="v" autoplay playsinline muted style="display:none"></video>
+<canvas id="p" style="display:none"></canvas>
+<canvas id="n" style="display:none"></canvas>
 <script>
 var C=document.getElementById('c'),X=C.getContext('2d'),V=document.getElementById('v');
+var P=document.getElementById('p'),PX=null;
+var N=document.getElementById('n'),NX=null;
 var S=document.getElementById('status'),camBtn=document.getElementById('camBtn');
 var controls=document.getElementById('controls');
-var ws=null,timer=null,streaming=false,jpegQuality=0.75;
+var ws=null,timer=null,streaming=false,jpegQuality=0.75,busy=false,netBusy=false;
+var stats={drawn:0,sent:0,net:0,bytes:0,skipped:0,drops:0,err:''};
+var PREVIEW_MAX=512;      // atlas slot size in GMod - larger is wasted
+var BUF_LIMIT=262144;     // skip frames while more than 256 KB is queued
 
 function log(msg,cls){S.textContent=msg;S.className=cls||'off';}
 
 function wsConnect(){
-  var port=parseInt(location.port)+1;
+  var port=parseInt(location.port||'27099')+1;
   var url='ws://127.0.0.1:'+port;
-  log('Connecting to GMod...','wait');
-  try{ws=new WebSocket(url);}catch(e){log('WebSocket error: '+e.message,'off');return;}
+  log('Connecting to GMod on '+url+' ...','wait');
+  try{ws=new WebSocket(url);}
+  catch(e){stats.err='ws: '+e.message;log('WebSocket error: '+e.message,'off');return;}
   ws.binaryType='arraybuffer';
   ws.onopen=function(){
-    log('Connected - Streaming '+V.videoWidth+'x'+V.videoHeight,'on');
-    ws.send(V.videoWidth+'x'+V.videoHeight);
-    startSend();
+    stats.err='';
+    log('Connected to GMod - streaming '+V.videoWidth+'x'+V.videoHeight,'on');
+    try{ws.send(V.videoWidth+'x'+V.videoHeight);}catch(e){}
   };
-  ws.onclose=function(){
-    log('Disconnected - retrying...','off');
-    stopSend();
-    setTimeout(wsConnect,2000);
+  ws.onclose=function(e){
+    // Note: the preview keeps running, only sending stops.
+    var code=(e&&e.code)||0;
+    stats.drops++;
+    stats.err='closed '+code+(e&&e.reason?' ('+e.reason+')':'')+
+      (code===1006?' - link overloaded or GMod not listening':'');
+    log('Lost connection to GMod, code '+code+' - reconnecting...','wait');
+    setTimeout(wsConnect,800);
   };
-  ws.onerror=function(){try{ws.close();}catch(e){}};
+  ws.onerror=function(){stats.err='ws refused '+url;try{ws.close();}catch(e){}};
+}
+
+// GMod tells us how big the multiplayer copy is allowed to be via /cfg.
+var netCfg={w:320,q:60,fps:10,on:0},lastNet=0;
+function pollCfg(){
+  fetch('/cfg').then(function(r){return r.json();}).then(function(j){
+    netCfg=j;
+    document.getElementById('netInfo').textContent=j.on
+      ?('multiplayer: sharing at '+j.w+'px, quality '+j.q+', '+j.fps+' fps')
+      :'multiplayer: idle (spawn a Webcam Screen to share)';
+  }).catch(function(){});
+}
+setInterval(pollCfg,2000);pollCfg();
+
+// Every binary message is prefixed with one byte: 0 = local preview, 1 = network copy
+function sendTagged(tag,b){
+  if(!b||!ws||ws.readyState!==1)return;
+  var done=function(a){
+    if(!ws||ws.readyState!==1)return;
+    var u=new Uint8Array(a.byteLength+1);
+    u[0]=tag;u.set(new Uint8Array(a),1);
+    ws.send(u.buffer);
+    stats.bytes+=u.length;
+    if(tag===1)stats.net++;else stats.sent++;
+  };
+  if(b.arrayBuffer){b.arrayBuffer().then(done);}
+  else{var r=new FileReader();r.onload=function(){done(r.result);};r.readAsArrayBuffer(b);}
+}
+
+// The preview draws as soon as the camera is live. It does NOT wait for the
+// websocket - if GMod isn't listening you still see yourself, and the diag
+// line below tells you what's wrong instead of leaving a blank canvas.
+function tick(){
+  if(V.readyState<2||!V.videoWidth||!V.videoHeight)return;
+
+  if(C.width!==V.videoWidth||C.height!==V.videoHeight){
+    C.width=V.videoWidth;C.height=V.videoHeight;
+  }
+
+  X.clearRect(0,0,C.width,C.height);
+  X.drawImage(V,0,0,C.width,C.height);
+
+  // Chroma key is applied HERE, once, before encoding. WebP keeps the alpha
+  // channel, so every viewer (local and remote) gets the cut-out for free.
+  var ck=document.getElementById('chromaOn').checked;
+  if(ck){
+    var id=X.getImageData(0,0,C.width,C.height);
+    var d=id.data,thr=+document.getElementById('chromaThr').value,thr2=thr*thr;
+    for(var i=0;i<d.length;i+=4){
+      var dr=d[i]-chromaR,dg=d[i+1]-chromaG,db=d[i+2]-chromaB;
+      if(dr*dr+dg*dg+db*db<thr2)d[i+3]=0;
+    }
+    X.putImageData(id,0,0);
+  }
+  stats.drawn++;
+
+  if(!ws||ws.readyState!==1)return;
+  var fmt=ck?'image/webp':'image/jpeg';
+
+  // Backpressure. If the socket is already backed up, skip this frame entirely.
+  // Without this the send queue grows without bound and the browser eventually
+  // kills the connection (close code 1006).
+  if(ws.bufferedAmount>BUF_LIMIT){stats.skipped++;return;}
+
+  // Full-ish resolution copy - stays on this machine. Capped at 512px because
+  // that is exactly the size of the atlas slot GMod renders it into, so
+  // anything larger is thrown away. This is what makes 720p/1080p safe to pick.
+  if(!busy){
+    var pw=Math.min(C.width,PREVIEW_MAX);
+    var ph=Math.max(1,Math.round(pw*C.height/C.width));
+    if(P.width!==pw||P.height!==ph){P.width=pw;P.height=ph;PX=null;}
+    if(!PX)PX=P.getContext('2d');
+    PX.clearRect(0,0,pw,ph);
+    PX.drawImage(C,0,0,pw,ph);
+    busy=true;
+    P.toBlob(function(b){busy=false;sendTagged(0,b);},fmt,ck?0.8:jpegQuality);
+  }
+
+  // small copy - this is what actually goes over the game server
+  var now=Date.now();
+  if(netCfg.on&&!netBusy&&now-lastNet>=1000/Math.max(1,netCfg.fps)){
+    lastNet=now;
+    var nw=Math.max(64,Math.min(C.width,netCfg.w|0));
+    var nh=Math.max(48,Math.round(nw*C.height/C.width));
+    if(N.width!==nw||N.height!==nh){N.width=nw;N.height=nh;NX=null;}
+    if(!NX)NX=N.getContext('2d');
+    NX.clearRect(0,0,nw,nh);
+    NX.drawImage(C,0,0,nw,nh);
+    netBusy=true;
+    N.toBlob(function(b){netBusy=false;sendTagged(1,b);},fmt,Math.max(0.1,Math.min(0.95,(netCfg.q|0)/100)));
+  }
 }
 
 function startSend(){
   stopSend();
   var fps=parseInt(document.getElementById('fps').value)||30;
-  timer=setInterval(function(){
-    if(!ws||ws.readyState!==1||V.readyState<2)return;
-    X.drawImage(V,0,0,C.width,C.height);
-    if(document.getElementById('chromaOn').checked){
-      var id=X.getImageData(0,0,C.width,C.height);
-      var d=id.data,thr2=document.getElementById('chromaThr').value*document.getElementById('chromaThr').value;
-      for(var i=0;i<d.length;i+=4){
-        var dr=d[i]-chromaR,dg=d[i+1]-chromaG,db=d[i+2]-chromaB;
-        if(dr*dr+dg*dg+db*db<thr2)d[i+3]=0;
-      }
-      X.putImageData(id,0,0);
-    }
-    var fmt=document.getElementById('chromaOn').checked?'image/webp':'image/jpeg';
-    var q=document.getElementById('chromaOn').checked?0.75:jpegQuality;
-    C.toBlob(function(b){
-      if(!b||!ws||ws.readyState!==1)return;
-      if(b.arrayBuffer){b.arrayBuffer().then(function(a){if(ws&&ws.readyState===1)ws.send(a);});}
-      else{var r=new FileReader();r.onload=function(){if(ws&&ws.readyState===1)ws.send(r.result);};r.readAsArrayBuffer(b);}
-    },fmt,q);
-  },Math.floor(1000/fps));
+  timer=setInterval(tick,Math.floor(1000/fps));
 }
 
 function stopSend(){if(timer){clearInterval(timer);timer=null;}}
+
+function diag(){
+  var st=ws?['connecting','open','closing','closed'][ws.readyState]:'not started';
+  var buf=ws?Math.round(ws.bufferedAmount/1024):0;
+  document.getElementById('diag').textContent=
+    'build 4 | video '+V.videoWidth+'x'+V.videoHeight+' rs'+V.readyState+
+    ' | preview '+P.width+'x'+P.height+
+    ' | ws '+st+' buf '+buf+'KB'+
+    ' | drawn '+stats.drawn+' sent '+stats.sent+'+'+stats.net+
+    ' skipped '+stats.skipped+' drops '+stats.drops+
+    ' ('+Math.round(stats.bytes/1024)+' KB)'+(stats.err?' | '+stats.err:'');
+}
+setInterval(diag,500);
+
+// Browsers throttle timers hard in backgrounded tabs, which stalls the stream
+// the moment you alt-tab into the game. A silent audio node keeps us alive.
+function keepAwake(){
+  try{
+    var A=new (window.AudioContext||window.webkitAudioContext)();
+    var o=A.createOscillator(),g=A.createGain();
+    g.gain.value=0.0001;o.connect(g);g.connect(A.destination);o.start();
+  }catch(e){}
+}
 
 camBtn.onclick=async function(){
   try{
@@ -166,6 +294,8 @@ camBtn.onclick=async function(){
     camBtn.textContent='Restart Camera';
     streaming=true;
     log('Camera active: '+V.videoWidth+'x'+V.videoHeight+' - connecting...','wait');
+    keepAwake();
+    startSend();   // preview starts immediately, independent of GMod
     wsConnect();
   }catch(e){
     log('Camera denied or error: '+e.message,'off');
@@ -217,55 +347,95 @@ static void WebSocketThread() {
         g_wsListenSock = INVALID_SOCKET;
         return;
     }
-    listen(g_wsListenSock, 2);
+    listen(g_wsListenSock, 4);
+
+    socket_t client = INVALID_SOCKET;
 
     while (g_running) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(g_wsListenSock, &fds);
-        timeval tv{1, 0};
-        if (select((int)g_wsListenSock + 1, &fds, nullptr, nullptr, &tv) <= 0) continue;
 
-        socket_t client = accept(g_wsListenSock, nullptr, nullptr);
-        if (client == INVALID_SOCKET) continue;
-
-        if (!ws_handshake(client)) {
-            CLOSESOCKET(client);
-            continue;
+        socket_t maxfd = g_wsListenSock;
+        if (client != INVALID_SOCKET) {
+            FD_SET(client, &fds);
+            if (client > maxfd) maxfd = client;
         }
 
-        // Read frames
-        while (g_running) {
+        timeval tv{0, 200000};
+        int ready = select((int)maxfd + 1, &fds, nullptr, nullptr, &tv);
+        if (ready < 0) break;
+        if (ready == 0) continue;
+
+        // A new browser (page reload, second tab) always wins. Without this the
+        // listen socket is never serviced while a stale connection is open, and
+        // the new page hangs in "connecting" forever.
+        if (FD_ISSET(g_wsListenSock, &fds)) {
+            socket_t fresh = accept(g_wsListenSock, nullptr, nullptr);
+            if (fresh != INVALID_SOCKET) {
+                if (ws_handshake(fresh)) {
+                    int nodelay = 1;
+                    setsockopt(fresh, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+                    if (client != INVALID_SOCKET) CLOSESOCKET(client);
+                    client = fresh;
+                    g_camConnected = true;
+                } else {
+                    CLOSESOCKET(fresh);
+                }
+            }
+        }
+
+        if (client == INVALID_SOCKET || !FD_ISSET(client, &fds)) continue;
+
+        {
             std::vector<unsigned char> payload;
             int opcode = ws_read_frame(client, payload);
-            if (opcode < 0) break;
-            if (opcode == 0x8) break;
-            if (opcode == 0x2 && !payload.empty()) {
+
+            if (opcode < 0 || opcode == 0x8) {
+                // Record why, so webcam_status can say whether the browser hung
+                // up, the socket broke, or a close frame arrived.
+                if (opcode == 0x8)       g_lastDrop = 1;   // clean websocket close
+                else if (opcode == -2)   g_lastDrop = 2;   // peer closed the TCP socket
+                else                     g_lastDrop = 3;   // socket error
+                g_lastDropErrno = ws_last_error;
+                g_camDrops++;
+
+                CLOSESOCKET(client);
+                client = INVALID_SOCKET;
+                g_camConnected = false;
+                continue;
+            }
+
+            if (opcode == 0x2 && payload.size() > 1) {
+                // First byte is the stream tag (0 = local preview, 1 = network copy)
+                unsigned char tag = payload[0];
+
+                if (tag == 1) {
+                    std::lock_guard<std::mutex> lock(g_netMutex);
+                    g_netFrameData.assign(payload.begin() + 1, payload.end());
+                    continue;
+                }
+
+                g_framesReceived++;
+
+                std::vector<unsigned char> image(payload.begin() + 1, payload.end());
+
+                // Only the dimensions are needed here. Fully decoding every
+                // frame to RGBA cost ~1.7ms and a 1.2MB copy per frame while
+                // holding the frame lock, and nothing ever read the result.
+                // Pixels are now decoded lazily, on demand, in GetPixels().
                 int w = 0, h = 0, channels = 0;
-                unsigned char* pixels = stbi_load_from_memory(
-                    payload.data(), (int)payload.size(), &w, &h, &channels, 4);
-                if (pixels) {
-                    // Apply chroma key if enabled
-                    if (g_chromaEnabled) {
-                        int kr = g_chromaR, kg = g_chromaG, kb = g_chromaB;
-                        int thr2 = g_chromaThreshold * g_chromaThreshold;
-                        for (int i = 0; i < w * h * 4; i += 4) {
-                            int dr = pixels[i] - kr;
-                            int dg = pixels[i+1] - kg;
-                            int db = pixels[i+2] - kb;
-                            if (dr*dr + dg*dg + db*db < thr2)
-                                pixels[i+3] = 0;
-                        }
+                bool gotInfo = stbi_info_from_memory(
+                    image.data(), (int)image.size(), &w, &h, &channels) != 0;
+
+                {
+                    std::lock_guard<std::mutex> lock(g_frameMutex);
+                    if (gotInfo && w > 0 && h > 0) {
+                        g_frameWidth = w;
+                        g_frameHeight = h;
                     }
-                    std::lock_guard<std::mutex> lock(g_frameMutex);
-                    g_frameWidth = w;
-                    g_frameHeight = h;
-                    g_rgbaData.assign(pixels, pixels + w * h * 4);
-                    g_frameData = std::move(payload);
-                    stbi_image_free(pixels);
-                } else {
-                    std::lock_guard<std::mutex> lock(g_frameMutex);
-                    g_frameData = std::move(payload);
+                    g_frameData.swap(image);
+                    g_frameId++;
                 }
             }
             if (opcode == 0x1 && !payload.empty()) {
@@ -298,8 +468,10 @@ static void WebSocketThread() {
                 }
             }
         }
-        CLOSESOCKET(client);
     }
+
+    if (client != INVALID_SOCKET) CLOSESOCKET(client);
+    g_camConnected = false;
 
     CLOSESOCKET(g_wsListenSock);
     g_wsListenSock = INVALID_SOCKET;
@@ -322,7 +494,22 @@ LUA_FUNCTION(Webcam_Start) {
     // Start HTTP server
     g_server = new httplib::Server();
     g_server->Get("/", [](const httplib::Request&, httplib::Response& res) {
+        // Without this the browser heuristically caches the page and keeps
+        // serving the old one after the DLL is rebuilt.
+        res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+        res.set_header("Pragma", "no-cache");
         res.set_content(HTML_PAGE, "text/html");
+    });
+
+    // Encoding budget for the multiplayer copy, driven from Lua.
+    g_server->Get("/cfg", [](const httplib::Request&, httplib::Response& res) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "{\"w\":%d,\"q\":%d,\"fps\":%d,\"on\":%d}",
+                 g_netW.load(), g_netQ.load(), g_netFps.load(),
+                 g_netEnabled.load() ? 1 : 0);
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(buf, "application/json");
     });
 
     g_serverThread = std::thread([] {
@@ -348,6 +535,12 @@ LUA_FUNCTION(Webcam_Stop) {
     if (g_wsThread.joinable()) g_wsThread.join();
     delete g_server; g_server = nullptr;
 
+    g_netEnabled = false;
+    {
+        std::lock_guard<std::mutex> lock(g_netMutex);
+        g_netFrameData.clear();
+    }
+
     std::lock_guard<std::mutex> lock(g_frameMutex);
     g_frameData.clear();
 
@@ -367,10 +560,40 @@ LUA_FUNCTION(Webcam_GetFrame) {
     return 3;
 }
 
+// Decodes the current frame to RGBA, but only when something actually asks for
+// pixels. Caller must hold g_frameMutex.
+static bool EnsureRgba() {
+    if (g_rgbaFrameId == g_frameId && !g_rgbaData.empty()) return true;
+    if (g_frameData.empty()) return false;
+
+    int w = 0, h = 0, channels = 0;
+    unsigned char* pixels = stbi_load_from_memory(
+        g_frameData.data(), (int)g_frameData.size(), &w, &h, &channels, 4);
+    if (!pixels) return false;
+
+    if (g_chromaEnabled) {
+        int kr = g_chromaR, kg = g_chromaG, kb = g_chromaB;
+        int thr2 = g_chromaThreshold * g_chromaThreshold;
+        for (int i = 0; i < w * h * 4; i += 4) {
+            int dr = pixels[i] - kr;
+            int dg = pixels[i+1] - kg;
+            int db = pixels[i+2] - kb;
+            if (dr*dr + dg*dg + db*db < thr2) pixels[i+3] = 0;
+        }
+    }
+
+    g_frameWidth = w;
+    g_frameHeight = h;
+    g_rgbaData.assign(pixels, pixels + w * h * 4);
+    stbi_image_free(pixels);
+    g_rgbaFrameId = g_frameId;
+    return true;
+}
+
 // webcam.GetPixels() -> string|false, width, height (raw RGBA)
 LUA_FUNCTION(Webcam_GetPixels) {
     std::lock_guard<std::mutex> lock(g_frameMutex);
-    if (g_rgbaData.empty()) { LUA->PushBool(false); return 1; }
+    if (!EnsureRgba()) { LUA->PushBool(false); return 1; }
     LUA->PushString((const char*)g_rgbaData.data(), g_rgbaData.size());
     LUA->PushNumber(g_frameWidth);
     LUA->PushNumber(g_frameHeight);
@@ -393,7 +616,7 @@ LUA_FUNCTION(Webcam_GetPort) {
 LUA_FUNCTION(Webcam_WriteFrame) {
     const char* path = LUA->CheckString(1);
     std::lock_guard<std::mutex> lock(g_frameMutex);
-    if (g_rgbaData.empty() || g_frameWidth == 0) { LUA->PushBool(false); return 1; }
+    if (!EnsureRgba() || g_frameWidth == 0) { LUA->PushBool(false); return 1; }
 
     FILE* f = fopen(path, "wb");
     if (!f) { LUA->PushBool(false); return 1; }
@@ -431,6 +654,68 @@ LUA_FUNCTION(Webcam_SetChromaKey) {
     if (LUA->IsType(5, GarrysMod::Lua::Type::Number))
         g_chromaThreshold = (int)LUA->GetNumber(5);
     return 0;
+}
+
+// webcam.IsCameraConnected() -> connected, framesReceived, drops, reason
+LUA_FUNCTION(Webcam_IsCameraConnected) {
+    LUA->PushBool(g_camConnected.load());
+    LUA->PushNumber(g_framesReceived.load());
+    LUA->PushNumber(g_camDrops.load());
+
+    int reason = g_lastDrop.load();
+    if (reason == 1)      LUA->PushString("browser closed the connection (close frame)");
+    else if (reason == 2) LUA->PushString("browser dropped the socket - usually its send queue overflowed");
+    else if (reason == 3) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "socket error %d", g_lastDropErrno.load());
+        LUA->PushString(buf);
+    }
+    else LUA->PushString("none");
+
+    return 4;
+}
+
+// webcam.SetNetConfig(width, quality, fps, enabled)
+// Tells the capture page how large the multiplayer copy of the frame may be.
+LUA_FUNCTION(Webcam_SetNetConfig) {
+    if (LUA->IsType(1, GarrysMod::Lua::Type::Number)) {
+        int w = (int)LUA->GetNumber(1);
+        if (w < 64) w = 64;
+        if (w > 960) w = 960;
+        g_netW = w;
+    }
+    if (LUA->IsType(2, GarrysMod::Lua::Type::Number)) {
+        int q = (int)LUA->GetNumber(2);
+        if (q < 10) q = 10;
+        if (q > 95) q = 95;
+        g_netQ = q;
+    }
+    if (LUA->IsType(3, GarrysMod::Lua::Type::Number)) {
+        int f = (int)LUA->GetNumber(3);
+        if (f < 1) f = 1;
+        if (f > 30) f = 30;
+        g_netFps = f;
+    }
+    if (LUA->IsType(4, GarrysMod::Lua::Type::Bool)) {
+        bool on = LUA->GetBool(4);
+        g_netEnabled = on;
+        if (!on) {
+            std::lock_guard<std::mutex> lock(g_netMutex);
+            g_netFrameData.clear();
+        }
+    }
+    return 0;
+}
+
+// webcam.GetNetFrame() -> string|false
+// Returns the newest multiplayer frame and consumes it, so the same frame is
+// never sent twice.
+LUA_FUNCTION(Webcam_GetNetFrame) {
+    std::lock_guard<std::mutex> lock(g_netMutex);
+    if (g_netFrameData.empty()) { LUA->PushBool(false); return 1; }
+    LUA->PushString((const char*)g_netFrameData.data(), g_netFrameData.size());
+    g_netFrameData.clear();
+    return 1;
 }
 
 // === RELAY CLIENT ===
@@ -589,6 +874,9 @@ GMOD_MODULE_OPEN() {
         LUA->PushCFunction(Webcam_GetPort);  LUA->SetField(-2, "GetPort");
         LUA->PushCFunction(Webcam_WriteFrame); LUA->SetField(-2, "WriteFrame");
         LUA->PushCFunction(Webcam_SetChromaKey); LUA->SetField(-2, "SetChromaKey");
+        LUA->PushCFunction(Webcam_IsCameraConnected); LUA->SetField(-2, "IsCameraConnected");
+        LUA->PushCFunction(Webcam_SetNetConfig); LUA->SetField(-2, "SetNetConfig");
+        LUA->PushCFunction(Webcam_GetNetFrame);  LUA->SetField(-2, "GetNetFrame");
         LUA->PushCFunction(Webcam_RelayConnect); LUA->SetField(-2, "RelayConnect");
         LUA->PushCFunction(Webcam_RelayDisconnect); LUA->SetField(-2, "RelayDisconnect");
         LUA->PushCFunction(Webcam_RelaySendFrame); LUA->SetField(-2, "RelaySendFrame");
